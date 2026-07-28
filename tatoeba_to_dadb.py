@@ -13,11 +13,13 @@ import json
 import os
 import shutil
 import socket
+import sys
 import tarfile
 import time
 import unicodedata
 import urllib.request
 import zipfile
+from array import array
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
 
@@ -196,9 +198,34 @@ def parse_audio_meta(tmp_dir: str) -> tuple[dict[int, list[dict]], set[str], set
     return s_audio, creators, licenses
 
 
-def build_direct_links(tmp_dir: str) -> dict[int, set[int]]:
+class LinkGraph:
+    """CSR adjacency over sentence ids.
+
+    A dict-of-sets for the ~28M Tatoeba link rows peaks at ~6GB and OOMs the
+    16GB CI runner; flat arrays hold the same graph in about 1GB.
+    Neighbour lists may contain duplicates (the export lists both
+    directions) — callers already collect into sets.
+    """
+
+    _EMPTY = array("i")
+
+    def __init__(self, offsets: array, neighbors: array, max_sid: int) -> None:
+        self._offsets = offsets
+        self._neighbors = neighbors
+        self._max_sid = max_sid
+
+    def neighbors(self, sid: int) -> array:
+        if 0 <= sid <= self._max_sid:
+            return self._neighbors[self._offsets[sid]:self._offsets[sid + 1]]
+        return self._EMPTY
+
+
+def build_direct_links(tmp_dir: str) -> LinkGraph:
     print("5. Mapping direct translations...")
-    links: dict[int, set[int]] = defaultdict(set)
+    # 'i' (int32) is fine: Tatoeba sids are ~13M, far below 2**31.
+    src = array("i")
+    dst = array("i")
+    max_sid = -1
     for line in stream_tar_bz2(os.path.join(tmp_dir, "links.tar.bz2")):
         parts = line.split("\t")
         if len(parts) < 2:
@@ -207,9 +234,32 @@ def build_direct_links(tmp_dir: str) -> dict[int, set[int]]:
             u, v = int(parts[0]), int(parts[1])
         except ValueError:
             continue
-        links[u].add(v)
-        links[v].add(u)
-    return links
+        src.append(u)
+        dst.append(v)
+        if u > max_sid:
+            max_sid = u
+        if v > max_sid:
+            max_sid = v
+
+    n = max_sid + 1
+    offsets = array("q", [0]) * (n + 1)
+    for u in src:
+        offsets[u + 1] += 1
+    for v in dst:
+        offsets[v + 1] += 1
+    for i in range(1, n + 1):
+        offsets[i] += offsets[i - 1]
+
+    neighbors = array("i", [0]) * (2 * len(src))
+    cursor = array("q", offsets[:n])
+    for u, v in zip(src, dst):
+        cu = cursor[u]
+        neighbors[cu] = v
+        cursor[u] = cu + 1
+        cv = cursor[v]
+        neighbors[cv] = u
+        cursor[v] = cv + 1
+    return LinkGraph(offsets, neighbors, max_sid)
 
 
 def count_languages(tmp_dir: str) -> dict[str, int]:
@@ -290,63 +340,62 @@ def run_pipeline(target_langs: list[str] | None,
     sid_to_lang: dict[int, str] = {}
     sid_to_primary: dict[int, int] = {}
     primary_to_sids: dict[int, list[int]] = defaultdict(list)
-    sid_to_merged_info: dict[int, tuple[str, str]] = {}
+    primary_info: dict[int, tuple[str, str]] = {}
     text_to_primary: dict[tuple[str, str], int] = {}
 
     for line in stream_tar_bz2(os.path.join(tmp_dir, "sentences_detailed.tar.bz2")):
         parts = line.split("\t")
         if len(parts) < 4:
             continue
-        sid, lang, text, user = int(parts[0]), parts[1], parts[2].strip(), parts[3]
+        lang = parts[1]
         if lang == r"\N":
             continue
-        sid_to_lang[sid] = lang
+        # Nothing downstream ever asks for the lang of a filtered-out sid, so
+        # skipping them here keeps sid_to_lang proportional to allowed_langs.
         if allowed_langs and lang not in allowed_langs:
             continue
+        sid, text = int(parts[0]), parts[2].strip()
+        lang = sys.intern(lang)
 
         key = (lang, unicodedata.normalize("NFKC", text))
         primary = text_to_primary.setdefault(key, sid)
+        sid_to_lang[sid] = lang
         primary_to_sids[primary].append(sid)
-        sid_to_merged_info[sid] = (text, user)
+        if primary == sid:
+            primary_info[sid] = (text, sys.intern(parts[3]))
         sid_to_primary[sid] = primary
 
-    # --- 2. Per-sentence groupIds (1-hop, no transitive merge) ---
-    print("7. Computing per-sentence translation groups (Tatoeba-style)...")
-    primary_to_groups: dict[int, set[int]] = {}
-    for primary, sids in primary_to_sids.items():
-        own_lang = sid_to_lang[primary]
-        ids = {primary}
-        for sid in sids:
-            for nb in links.get(sid, ()):
-                np = sid_to_primary.get(nb)
-                if np is not None and sid_to_lang[np] != own_lang:
-                    ids.add(np)
-        primary_to_groups[primary] = ids
-
-    # --- 3. Output filter ---
-    # Secondary-lang sentences must have at least one direct main_lang link;
-    # otherwise the dict would carry entries with no main-lang counterpart.
-    print("8. Identifying valid sentences for output...")
-    valid_primaries: set[int] = set()
-    for primary, groups in primary_to_groups.items():
-        lang = sid_to_lang[primary]
-        if not main_lang or lang == main_lang:
-            valid_primaries.add(primary)
-        elif any(sid_to_lang.get(g) == main_lang for g in groups):
-            valid_primaries.add(primary)
+    del text_to_primary  # normalized-text keys dominate this pass's memory
 
     tag_bank = _build_tag_bank(unique_tags, licenses, creators)
 
-    # --- 4. Emit chunked JSON banks ---
-    print("9. Generating language chunks...")
+    # --- 2. Group, filter and emit in one streaming pass ---
+    # Per-sentence groupIds (1-hop, no transitive merge), computed per primary
+    # so the full primary→group map never has to be held in memory at once.
+    print("7. Computing translation groups and generating language chunks...")
     lang_states: dict[str, dict] = {}
     total_processed = 0
 
-    for primary in sorted(valid_primaries):
+    for primary in sorted(primary_to_sids):
         lang = sid_to_lang[primary]
         if target_langs and lang not in target_langs:
             continue
-        text, user = sid_to_merged_info[primary]
+
+        group_ids = {primary}
+        for sid in primary_to_sids[primary]:
+            for nb in links.neighbors(sid):
+                np = sid_to_primary.get(nb)
+                if np is not None and sid_to_lang[np] != lang:
+                    group_ids.add(np)
+
+        # Secondary-lang sentences must have at least one direct main_lang
+        # link; otherwise the dict would carry entries with no main-lang
+        # counterpart.
+        if main_lang and lang != main_lang:
+            if not any(sid_to_lang.get(g) == main_lang for g in group_ids):
+                continue
+
+        text, user = primary_info[primary]
 
         state = lang_states.get(lang)
         if state is None:
@@ -371,7 +420,8 @@ def run_pipeline(target_langs: list[str] | None,
             state["f"].write("[\n")
 
         merged_sids = primary_to_sids[primary]
-        total_review = sum(reviews[s] for s in merged_sids)
+        # .get keeps the defaultdict from materialising an entry per queried sid.
+        total_review = sum(reviews.get(s, 0) for s in merged_sids)
         merged_tags: set[str] = set()
         for s in merged_sids:
             merged_tags.update(sentence_tags.get(s, []))
@@ -397,7 +447,7 @@ def run_pipeline(target_langs: list[str] | None,
             stats.append(entry)
 
         obj = {
-            "groupIds": sorted(primary_to_groups[primary]),
+            "groupIds": sorted(group_ids),
             "sentence": text,
             "tags":     sorted(merged_tags),
             "stats":    stats,
@@ -414,8 +464,10 @@ def run_pipeline(target_langs: list[str] | None,
         if total_processed % 100_000 == 0:
             print(f"   ... Processed {total_processed} primary sentences")
 
-    # --- 5. Zip ---
-    print("10. Zipping results...")
+    del links, sid_to_lang, sid_to_primary, primary_to_sids, primary_info
+
+    # --- 3. Zip ---
+    print("8. Zipping results...")
     lang_counts: dict[str, int] = {}
     for lang, state in lang_states.items():
         state["f"].write("\n]\n")
